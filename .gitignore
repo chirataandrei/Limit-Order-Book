@@ -1,0 +1,29 @@
+# build outputs
+lob
+bench
+*.o
+*.a
+*.out
+
+# cmake (if we add it later)
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+Makefile
+build/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+
+# profiling artifacts
+*.prof
+*.perf
+callgrind.out.*
+massif.out.*
+gmon.out
+perf.data
+perf.data.old
