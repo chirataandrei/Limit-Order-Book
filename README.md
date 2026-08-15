@@ -5,25 +5,27 @@ A from-scratch central limit order book aimed at low latency. No external depend
 ## Build
 
 ```bash
-# tests
-g++ -std=c++20 -O2 -Wall -Wextra -o lob main.cpp
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build -j
 
-# benchmarks
-g++ -std=c++20 -O2 -march=native -o bench bench.cpp
+./build/lob_tests   # correctness tests
+./build/lob_bench   # micro-benchmarks
 ```
 
-Requires GCC 11+ or Clang 14+ for C++20 concepts and `std::chrono::steady_clock`.
+Requires GCC 11+ or Clang 14+ for C++20 concepts and `std::chrono::steady_clock`, and CMake 3.16+.
 
 ## Structure
 
 ```
-ObjectPool.hpp   – fixed-size pool, O(1) alloc/free, no heap after init
-Order.hpp        – 64-byte cache-line-aligned node, intrusive list pointers + back-pointer
-PriceLevel.hpp   – intrusive doubly-linked FIFO of orders at one price
-OrderBook.hpp    – bid/ask maps, order-id lookup, add/cancel/match
-Benchmark.hpp    – minimal timing harness (setup/bench/teardown separation, warmup)
-main.cpp         – correctness tests
-bench.cpp        – micro-benchmarks
+include/lob/
+  ObjectPool.hpp   – fixed-size pool, O(1) alloc/free, no heap after init
+  Order.hpp        – 64-byte cache-line-aligned node, intrusive list pointers + back-pointer
+  PriceLevel.hpp   – intrusive doubly-linked FIFO of orders at one price
+  OrderBook.hpp    – bid/ask maps, order-id lookup, add/cancel/match
+  Benchmark.hpp    – minimal timing harness (setup/bench/teardown separation, warmup)
+src/main.cpp       – correctness tests
+benchmarks/bench.cpp – micro-benchmarks
+CMakeLists.txt     – builds lob_tests and lob_bench
 ```
 
 ## How it works

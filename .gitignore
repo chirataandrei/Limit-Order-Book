@@ -1,16 +1,27 @@
 # build outputs
 lob
+lob_pool
+lob_tests
+lob_bench
 bench
 *.o
 *.a
 *.out
+*.dSYM/
+core
 
-# cmake (if we add it later)
+# cmake
 CMakeFiles/
 CMakeCache.txt
 cmake_install.cmake
+CTestTestfile.cmake
+compile_commands.json
 Makefile
 build/
+cmake-build-*/
+
+# editor/tooling caches
+.cache/
 
 # IDE
 .vscode/
