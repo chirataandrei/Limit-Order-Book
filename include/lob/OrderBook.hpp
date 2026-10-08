@@ -3,13 +3,15 @@
 #include "ObjectPool.hpp"
 #include "Order.hpp"
 #include "PriceLevel.hpp"
+#include "TickBitmap.hpp"
 
 #include <algorithm>
 #include <cassert>
 #include <chrono>
+#include <cmath>
 #include <cstdint>
-#include <functional>
-#include <map>
+#include <limits>
+#include <memory>
 #include <stdexcept>
 #include <unordered_map>
 #include <vector>
@@ -24,13 +26,28 @@ struct Trade {
     uint64_t timestamp;
 };
 
+// Price grid: level i sits at min_price + i * tick_size. Orders must land
+// exactly on a tick inside [0, num_ticks); anything else is rejected.
+struct BookConfig {
+    double   min_price = 0.0;
+    double   tick_size = 0.01;
+    uint32_t num_ticks = 100'000;   // default grid: 0.00 – 999.99
+};
+
 class OrderBook {
 public:
     // 1M orders in the pool = 64 MB. Enough headroom for most instruments.
     // TODO: make this a template parameter once we benchmark the tick-array replacement.
     static constexpr std::size_t POOL_CAPACITY = 1'000'000;
 
-    OrderBook() { order_map_.reserve(POOL_CAPACITY); }
+    explicit OrderBook(BookConfig cfg = {})
+        : min_price_(cfg.min_price), tick_size_(cfg.tick_size), num_ticks_(cfg.num_ticks),
+          bids_(cfg), asks_(cfg)
+    {
+        if (!(cfg.tick_size > 0.0) || cfg.num_ticks == 0 || !std::isfinite(cfg.min_price))
+            throw std::invalid_argument("invalid BookConfig");
+        order_map_.reserve(POOL_CAPACITY);
+    }
 
     OrderBook(const OrderBook&)            = delete;
     OrderBook& operator=(const OrderBook&) = delete;
@@ -45,6 +62,7 @@ public:
     {
         if (quantity == 0) [[unlikely]]
             throw std::invalid_argument("quantity must be > 0");
+        const uint32_t tick = tick_of_(price);   // throws on off-grid / out-of-range
         if (order_map_.contains(id)) [[unlikely]]
             throw std::invalid_argument("duplicate order id");
 
@@ -54,10 +72,10 @@ public:
         if (!o) [[unlikely]] throw std::bad_alloc{};
         *o = make_order(id, timestamp, quantity, price, side);
 
-        if (side == Side::Buy)
-            bids_.try_emplace(price, price).first->second.push_back(o);
-        else
-            asks_.try_emplace(price, price).first->second.push_back(o);
+        LevelArray& s = (side == Side::Buy) ? bids_ : asks_;
+        PriceLevel& lvl = s.levels[tick];
+        if (lvl.empty()) occupy_(s, tick, side == Side::Buy);
+        lvl.push_back(o);
 
         order_map_.emplace(id, o);
 
@@ -66,8 +84,9 @@ public:
         return trades;
     }
 
-    // O(1) cancel via the order_map lookup + intrusive list remove.
-    // The map erase (if the level goes empty) is O(log P) but unavoidable.
+    // O(1) cancel via the order_map lookup + intrusive list remove. If the
+    // level goes empty, the bitmap update is O(log64 P) – at most one extra
+    // descent when it was the best level.
     bool cancel_order(uint64_t id) noexcept {
         auto it = order_map_.find(id);
         if (it == order_map_.end()) return false;
@@ -80,8 +99,8 @@ public:
         order_map_.erase(it);
 
         if (lvl->empty()) {
-            if (o->side == Side::Buy) bids_.erase(lvl->price());
-            else                      asks_.erase(lvl->price());
+            if (o->side == Side::Buy) release_(bids_, lvl->tick(), true);
+            else                      release_(asks_, lvl->tick(), false);
         }
 
         pool_.deallocate(o);
@@ -89,44 +108,93 @@ public:
     }
 
     [[nodiscard]] const PriceLevel* best_bid() const noexcept {
-        return bids_.empty() ? nullptr : &bids_.begin()->second;
+        return bids_.count ? &bids_.levels[bids_.best] : nullptr;
     }
     [[nodiscard]] const PriceLevel* best_ask() const noexcept {
-        return asks_.empty() ? nullptr : &asks_.begin()->second;
+        return asks_.count ? &asks_.levels[asks_.best] : nullptr;
     }
     [[nodiscard]] double mid_price() const noexcept {
-        if (bids_.empty() || asks_.empty()) return 0.0;
-        return (bids_.begin()->first + asks_.begin()->first) * 0.5;
+        if (!bids_.count || !asks_.count) return 0.0;
+        return (bids_.levels[bids_.best].price() + asks_.levels[asks_.best].price()) * 0.5;
     }
     [[nodiscard]] double spread() const noexcept {
-        if (bids_.empty() || asks_.empty()) return 0.0;
-        return asks_.begin()->first - bids_.begin()->first;
+        if (!bids_.count || !asks_.count) return 0.0;
+        return asks_.levels[asks_.best].price() - bids_.levels[bids_.best].price();
     }
 
-    [[nodiscard]] std::size_t bid_levels()  const noexcept { return bids_.size();      }
-    [[nodiscard]] std::size_t ask_levels()  const noexcept { return asks_.size();      }
+    [[nodiscard]] std::size_t bid_levels()  const noexcept { return bids_.count;       }
+    [[nodiscard]] std::size_t ask_levels()  const noexcept { return asks_.count;       }
     [[nodiscard]] std::size_t order_count() const noexcept { return order_map_.size(); }
     [[nodiscard]] std::size_t pool_used()   const noexcept { return pool_.allocated(); }
 
 private:
-    // Bids sorted high→low, asks low→high, so begin() is always best price.
-    using BidMap = std::map<double, PriceLevel, std::greater<double>>;
-    using AskMap = std::map<double, PriceLevel, std::less<double>>;
+    static constexpr uint32_t NO_TICK = std::numeric_limits<uint32_t>::max();
+
+    // One side of the book: a dense array of levels indexed by tick, plus a
+    // bitmap of which ticks are non-empty and a cached best tick
+    // (highest for bids, lowest for asks).
+    struct LevelArray {
+        std::unique_ptr<PriceLevel[]> levels;
+        TickBitmap                    occupied;
+        std::size_t                   count = 0;
+        uint32_t                      best  = NO_TICK;
+
+        explicit LevelArray(const BookConfig& cfg)
+            : levels(std::make_unique<PriceLevel[]>(cfg.num_ticks)),
+              occupied(cfg.num_ticks)
+        {
+            for (uint32_t i = 0; i < cfg.num_ticks; ++i)
+                levels[i].init(cfg.min_price + static_cast<double>(i) * cfg.tick_size, i);
+        }
+    };
+
+    double   min_price_;
+    double   tick_size_;
+    uint32_t num_ticks_;
 
     ObjectPool<Order, POOL_CAPACITY>     pool_;
-    BidMap                               bids_;
-    AskMap                               asks_;
+    LevelArray                           bids_;
+    LevelArray                           asks_;
     std::unordered_map<uint64_t, Order*> order_map_;
 
+    [[nodiscard]] uint32_t tick_of_(double price) const {
+        const double raw = (price - min_price_) / tick_size_;
+        const double r   = std::nearbyint(raw);
+        // `!(…)` form also rejects NaN.
+        if (!(r >= 0.0 && r < static_cast<double>(num_ticks_)) || std::fabs(raw - r) > 1e-6)
+            [[unlikely]]
+            throw std::invalid_argument("price outside tick grid");
+        return static_cast<uint32_t>(r);
+    }
+
+    // Level just went empty → non-empty.
+    static void occupy_(LevelArray& s, uint32_t tick, bool is_bid) noexcept {
+        s.occupied.set(tick);
+        ++s.count;
+        if (s.best == NO_TICK || (is_bid ? tick > s.best : tick < s.best))
+            s.best = tick;
+    }
+
+    // Level just went non-empty → empty. Re-derive best only if it was the best.
+    static void release_(LevelArray& s, uint32_t tick, bool is_bid) noexcept {
+        s.occupied.clear(tick);
+        --s.count;
+        if (s.count == 0)
+            s.best = NO_TICK;
+        else if (tick == s.best)
+            s.best = static_cast<uint32_t>(is_bid ? s.occupied.highest()
+                                                  : s.occupied.lowest());
+    }
+
     void match_(std::vector<Trade>& out) {
-        while (!bids_.empty() && !asks_.empty()) {
-            auto  bid_it = bids_.begin();
-            auto  ask_it = asks_.begin();
+        while (bids_.count && asks_.count) {
+            const uint32_t bt = bids_.best;
+            const uint32_t at = asks_.best;
 
-            if (bid_it->first < ask_it->first) break;  // no cross
+            if (bt < at) break;  // no cross
 
-            PriceLevel& blvl = bid_it->second;
-            PriceLevel& alvl = ask_it->second;
+            PriceLevel& blvl = bids_.levels[bt];
+            PriceLevel& alvl = asks_.levels[at];
             Order*      bo   = blvl.front();
             Order*      ao   = alvl.front();
 
@@ -135,13 +203,13 @@ private:
             // Execution price = resting ask (maker side).
             // If the sell was the aggressor, we'd want bid price instead –
             // for now this is fine since we don't track aggressor vs. resting.
-            out.push_back({ bo->id, ao->id, qty, ask_it->first, now_ns() });
+            out.push_back({ bo->id, ao->id, qty, alvl.price(), now_ns() });
 
             if (bo->quantity == qty) {
                 blvl.remove(bo);
                 order_map_.erase(bo->id);
                 pool_.deallocate(bo);
-                if (blvl.empty()) bids_.erase(bid_it);
+                if (blvl.empty()) release_(bids_, bt, true);
             } else {
                 blvl.fill(bo, qty);
             }
@@ -150,7 +218,7 @@ private:
                 alvl.remove(ao);
                 order_map_.erase(ao->id);
                 pool_.deallocate(ao);
-                if (alvl.empty()) asks_.erase(ask_it);
+                if (alvl.empty()) release_(asks_, at, false);
             } else {
                 alvl.fill(ao, qty);
             }

@@ -3,9 +3,12 @@
 
 #include <cassert>
 #include <chrono>
+#include <cmath>
 #include <cstdint>
 #include <iomanip>
 #include <iostream>
+#include <map>
+#include <random>
 #include <vector>
 
 #include "OrderBook.hpp"
@@ -87,9 +90,9 @@ int main() {
         OrderBook book;
 
         // Resting asks at three levels
-        book.add_order(1, 50,  100.0, Side::Sell);
-        book.add_order(2, 50,  101.0, Side::Sell);
-        book.add_order(3, 50,  102.0, Side::Sell);
+        (void)book.add_order(1, 50,  100.0, Side::Sell);
+        (void)book.add_order(2, 50,  101.0, Side::Sell);
+        (void)book.add_order(3, 50,  102.0, Side::Sell);
         print_top(book);
 
         // Aggressive buy that sweeps all three levels
@@ -111,9 +114,9 @@ int main() {
         std::cout << "── 4. Cancel ──\n";
         OrderBook book;
 
-        book.add_order(10, 200, 50.0, Side::Buy);    // level with 200
-        book.add_order(11, 300, 50.0, Side::Buy);    // same level → 500 total
-        book.add_order(12, 100, 50.0, Side::Buy);
+        (void)book.add_order(10, 200, 50.0, Side::Buy);    // level with 200
+        (void)book.add_order(11, 300, 50.0, Side::Buy);    // same level → 500 total
+        (void)book.add_order(12, 100, 50.0, Side::Buy);
         print_top(book);
 
         assert(book.cancel_order(11));               // remove middle order
@@ -141,8 +144,8 @@ int main() {
         std::cout << "── 6. FIFO priority ──\n";
         OrderBook book;
 
-        book.add_order(20, 40, 75.0, Side::Sell);   // order 20 is first (head)
-        book.add_order(21, 60, 75.0, Side::Sell);   // order 21 is second
+        (void)book.add_order(20, 40, 75.0, Side::Sell);   // order 20 is first (head)
+        (void)book.add_order(21, 60, 75.0, Side::Sell);   // order 21 is second
 
         auto trades = book.add_order(22, 40, 75.0, Side::Buy);
         // Should fill against order 20 first (FIFO)
@@ -162,10 +165,10 @@ int main() {
     {
         std::cout << "── 7. Duplicate ID rejection ──\n";
         OrderBook book;
-        book.add_order(30, 100, 80.0, Side::Buy);
+        (void)book.add_order(30, 100, 80.0, Side::Buy);
 
         bool threw = false;
-        try { book.add_order(30, 50, 81.0, Side::Buy); }
+        try { (void)book.add_order(30, 50, 81.0, Side::Buy); }
         catch (const std::invalid_argument&) { threw = true; }
         assert(threw);
         std::cout << "  duplicate id=30 rejected ✓\n\n";
@@ -175,8 +178,8 @@ int main() {
     {
         std::cout << "── 8. Mid-price / spread ──\n";
         OrderBook book;
-        book.add_order(40, 10, 99.0,  Side::Buy);
-        book.add_order(41, 10, 101.0, Side::Sell);
+        (void)book.add_order(40, 10, 99.0,  Side::Buy);
+        (void)book.add_order(41, 10, 101.0, Side::Sell);
 
         assert(book.spread()    == 2.0);
         assert(book.mid_price() == 100.0);
@@ -201,14 +204,14 @@ int main() {
 
         // Pre-populate 100 ask levels so the buy orders below don't cross.
         for (uint64_t i = 0; i < 100; ++i)
-            book.add_order(ASK_BASE + i, 100, 200.0 + static_cast<double>(i), Side::Sell);
+            (void)book.add_order(ASK_BASE + i, 100, 200.0 + static_cast<double>(i), Side::Sell);
 
         constexpr std::size_t N = 100'000;
 
         // Benchmark: add N buy orders at price 100 (no match, they rest).
         auto t0 = std::chrono::steady_clock::now();
         for (uint64_t i = 0; i < N; ++i)
-            book.add_order(ADD_BASE + i, 10, 100.0, Side::Buy);
+            (void)book.add_order(ADD_BASE + i, 10, 100.0, Side::Buy);
         auto t1 = std::chrono::steady_clock::now();
 
         auto add_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count();
@@ -225,7 +228,7 @@ int main() {
 
         // Benchmark: matching sweep – 100k sells cross 100k pre-placed buys.
         for (uint64_t i = 0; i < N; ++i)
-            book.add_order(BID_BASE + i, 1, 150.0, Side::Buy);   // rest bids @ 150
+            (void)book.add_order(BID_BASE + i, 1, 150.0, Side::Buy);   // rest bids @ 150
 
         std::size_t fill_count = 0;
         auto t4 = std::chrono::steady_clock::now();
@@ -240,6 +243,110 @@ int main() {
                   << "  (total fills=" << fill_count << ")\n\n";
 
         assert(fill_count == N);
+    }
+
+    // ── 10. Tick grid validation ─────────────────────────────────────────────
+    {
+        std::cout << "── 10. Tick grid validation ──\n";
+        OrderBook book(BookConfig{ .min_price = 10.0, .tick_size = 0.25, .num_ticks = 100 });
+
+        auto rejects = [&](double px) {
+            try { (void)book.add_order(1, 1, px, Side::Buy); }
+            catch (const std::invalid_argument&) { return true; }
+            return false;
+        };
+        assert(rejects(9.75));      // below grid
+        assert(rejects(35.0));      // first price past the last tick (10 + 100*0.25)
+        assert(rejects(10.1));      // off-tick
+        assert(rejects(std::nan("")));
+        assert(book.order_count() == 0 && book.pool_used() == 0);   // nothing leaked
+
+        (void)book.add_order(1, 1, 10.0,  Side::Buy);    // first tick
+        (void)book.add_order(2, 1, 34.75, Side::Sell);   // last tick
+        assert(book.best_bid()->price() == 10.0);
+        assert(book.best_ask()->price() == 34.75);
+        std::cout << "  off-grid / out-of-range rejected, edges accepted ✓\n\n";
+    }
+
+    // ── 11. Best price tracks cancels and fills across bitmap words ──────────
+    {
+        std::cout << "── 11. Best-price tracking ──\n";
+        // 1M ticks → 4-level bitmap; the ticks below straddle word and
+        // super-word boundaries (64, 4096, 262144).
+        OrderBook book(BookConfig{ .min_price = 0.0, .tick_size = 1.0, .num_ticks = 1'000'000 });
+        const double px[] = { 3, 64, 4095, 4096, 262143, 262144, 999'999 };
+
+        uint64_t id = 1;
+        for (double p : px) (void)book.add_order(id++, 1, p, Side::Buy);   // ids 1..7
+        for (double p : px) (void)book.add_order(id++, 1, p, Side::Buy);   // ids 8..14, same levels
+        assert(book.bid_levels() == 7 && book.order_count() == 14);
+
+        // Walk the best bid down by cancelling both orders at each level.
+        for (int i = 6; i >= 0; --i) {
+            assert(book.best_bid()->price() == px[i]);
+            assert(book.cancel_order(1 + i));
+            assert(book.best_bid()->price() == px[i]);          // one order left
+            assert(book.cancel_order(8 + i));
+        }
+        assert(book.best_bid() == nullptr && book.bid_levels() == 0);
+
+        // Asks: best is the lowest tick; a sweep must advance it level by level.
+        id = 100;
+        for (double p : px) (void)book.add_order(id++, 1, p, Side::Sell);
+        assert(book.best_ask()->price() == 3);
+        auto t = book.add_order(200, 3, 64.0, Side::Buy);       // takes 3 and 64, rests 1
+        assert(t.size() == 2 && t[0].price == 3 && t[1].price == 64);
+        assert(book.best_ask()->price() == 4095);
+        assert(book.best_bid()->price() == 64 && book.best_bid()->get_total_volume() == 1);
+        std::cout << "  best bid/ask correct across word boundaries ✓\n\n";
+    }
+
+    // ── 12. Randomised differential test vs. std::map reference ──────────────
+    {
+        std::cout << "── 12. Random add/cancel vs. reference ──\n";
+        OrderBook book(BookConfig{ .min_price = 0.0, .tick_size = 1.0, .num_ticks = 20'000 });
+        std::mt19937_64 rng(12345);
+
+        // Bids live in [0, 9999], asks in [10000, 19999] so nothing ever crosses
+        // and the reference model needs no matching logic.
+        struct Live { double px; uint64_t qty; Side side; };
+        std::map<double, uint64_t> ref_bid, ref_ask;     // price → resting qty
+        std::map<uint64_t, Live>   live;
+        uint64_t next_id = 1;
+
+        for (int step = 0; step < 200'000; ++step) {
+            if (live.empty() || rng() % 100 < 55) {
+                const Side     side = (rng() & 1) ? Side::Buy : Side::Sell;
+                const double   px   = static_cast<double>(rng() % 10'000) + (side == Side::Sell ? 10'000 : 0);
+                const uint64_t q    = 1 + rng() % 50;
+                assert(book.add_order(next_id, q, px, side).empty());
+                (side == Side::Buy ? ref_bid : ref_ask)[px] += q;
+                live[next_id++] = { px, q, side };
+            } else {
+                auto it = live.begin();
+                std::advance(it, static_cast<std::ptrdiff_t>(rng() % live.size()));
+                const Live l = it->second;
+                assert(book.cancel_order(it->first));
+                auto& ref = (l.side == Side::Buy) ? ref_bid : ref_ask;
+                if ((ref[l.px] -= l.qty) == 0) ref.erase(l.px);
+                live.erase(it);
+            }
+
+            assert(book.order_count() == live.size());
+            assert(book.bid_levels()  == ref_bid.size());
+            assert(book.ask_levels()  == ref_ask.size());
+            if (ref_bid.empty()) assert(!book.best_bid());
+            else {
+                assert(book.best_bid()->price() == ref_bid.rbegin()->first);
+                assert(book.best_bid()->get_total_volume() == ref_bid.rbegin()->second);
+            }
+            if (ref_ask.empty()) assert(!book.best_ask());
+            else {
+                assert(book.best_ask()->price() == ref_ask.begin()->first);
+                assert(book.best_ask()->get_total_volume() == ref_ask.begin()->second);
+            }
+        }
+        std::cout << "  200k random ops, book == reference at every step ✓\n\n";
     }
 
     std::cout << "All assertions passed.\n";

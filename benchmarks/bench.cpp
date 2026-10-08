@@ -27,12 +27,11 @@ static constexpr uint64_t SWEEP_ASK_BASE= 8'000'001;  // 1k slots
 static constexpr uint64_t SWEEP_BID_BASE= 8'100'001;  // one per iteration
 
 // ── 1. add_order – no matching ───────────────────────────────────────────────
-// Each order goes to a unique price level (prices are id-derived), so this
-// exercises std::map::try_emplace on every insert. Expect ~log(1M)=20
-// comparisons per op, which is the main cost. Swap for tick-array to fix this.
+// Each order goes to a unique price level (prices are id-derived), so every
+// insert opens a new level: one tick-array slot + one bitmap update.
 
 static Stats bench_add() {
-    static OrderBook book;
+    static OrderBook book(BookConfig{ .min_price = 1'000'001.0, .tick_size = 1.0, .num_ticks = 1'000'000 });
     static constexpr uint64_t N = 1'000'000;
 
     struct S { OrderBook* b; };
@@ -59,7 +58,7 @@ static Stats bench_add() {
 // worst case, and closer to real cancel-replace traffic than FIFO cancels.
 
 static Stats bench_cancel() {
-    static OrderBook book;
+    static OrderBook book(BookConfig{ .min_price = 500'000.0, .tick_size = 1.0, .num_ticks = 500'000 });
     static constexpr uint64_t N = 500'000;
 
     // Fixed shuffle so results are reproducible across runs.
@@ -92,11 +91,11 @@ static Stats bench_cancel() {
 // ── 3a. add+match – 1:1 fill ─────────────────────────────────────────────────
 // N asks sit at 100.0. N aggressive buys arrive one by one, each immediately
 // matching the front of the ask queue (FIFO). This is the tightest hot path:
-// pool allocate → map insert at existing level → match() pops one ask → pool free.
+// pool allocate → push onto existing level → match() pops one ask → pool free.
 // Peak pool usage = N asks + 1 buy-in-flight = N+1. Must stay under POOL_CAPACITY.
 
 static Stats bench_match_1for1() {
-    static OrderBook book;
+    static OrderBook book(BookConfig{ .min_price = 100.0, .tick_size = 1.0, .num_ticks = 1'000 });
     static constexpr uint64_t N = 500'000;  // each side N, peak usage N+1
 
     struct S { OrderBook* b; };
@@ -125,11 +124,11 @@ static Stats bench_match_1for1() {
 
 // ── 3b. sweep match – 1 order clears N levels ────────────────────────────────
 // A single large buy sweeps through 1000 ask price levels consecutively.
-// Measures how fast match() can iterate and erase map entries when a
-// market order (or a very aggressive limit) walks the book.
+// Measures how fast match() can advance the best-level pointer and release
+// levels when a market order (or a very aggressive limit) walks the book.
 
 static Stats bench_match_sweep() {
-    static OrderBook book;
+    static OrderBook book(BookConfig{ .min_price = 100.0, .tick_size = 1.0, .num_ticks = 1'000 });
     static constexpr uint64_t LEVELS = 1'000;
     static uint64_t sweep_bid_id = SWEEP_BID_BASE;
 

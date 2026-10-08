@@ -1,0 +1,50 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: test (${{ matrix.cxx }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        cxx: [g++, clang++]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_COMPILER=${{ matrix.cxx }}
+
+      # Builds lob_tests and lob_bench. The benchmark is only compiled, never
+      # run: shared runners are too noisy to say anything about latency.
+      - name: Build
+        run: cmake --build build -j
+
+      - name: Run tests
+        run: ./build/lob_tests
+
+  sanitizers:
+    name: ASan + UBSan (clang++)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build tests with sanitizers
+        run: >
+          clang++ -std=c++20 -O1 -g -fno-omit-frame-pointer
+          -fsanitize=address,undefined -fno-sanitize-recover=all
+          -I include -I include/lob -o lob_san src/main.cpp
+
+      - name: Run tests
+        run: ./lob_san

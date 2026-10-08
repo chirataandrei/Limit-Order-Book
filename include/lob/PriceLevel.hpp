@@ -14,31 +14,25 @@ namespace lob {
 // itself isn't pooled – adding a dummy Order node would be awkward.
 //
 // The `level` back-pointer on each Order is kept in sync here so that
-// OrderBook::cancel_order() can call remove() without knowing which map entry
+// OrderBook::cancel_order() can call remove() without knowing which tick slot
 // the order belongs to.
 class PriceLevel {
 public:
-    explicit PriceLevel(double price) noexcept : price_(price) {}
+    // Default-constructible so OrderBook can allocate the whole tick array in
+    // one shot; init() stamps the price/tick once. Levels never move after
+    // that (the array is fixed-size), so Order::level back-pointers stay valid.
+    PriceLevel() noexcept = default;
 
     PriceLevel(const PriceLevel&)            = delete;
     PriceLevel& operator=(const PriceLevel&) = delete;
+    PriceLevel(PriceLevel&&)                 = delete;
+    PriceLevel& operator=(PriceLevel&&)      = delete;
 
-    // Movable for std::map::try_emplace. The move has to re-point every node's
-    // `level` back-pointer, which is O(n) – but this only happens during map
-    // rebalancing at insertion time, not on the matching hot path.
-    PriceLevel(PriceLevel&& o) noexcept
-        : head_(o.head_), tail_(o.tail_),
-          size_(o.size_), _pad_(0),
-          total_volume_(o.total_volume_), price_(o.price_)
-    {
-        for (Order* cur = head_; cur; cur = cur->next)
-            cur->level = this;
-        o.head_ = o.tail_ = nullptr;
-        o.size_ = 0;
-        o.total_volume_ = 0;
+    void init(double price, uint32_t tick) noexcept {
+        assert(empty());
+        price_ = price;
+        tick_  = tick;
     }
-
-    PriceLevel& operator=(PriceLevel&&) = delete;
 
     void push_back(Order* o) noexcept {
         assert(o && !o->prev && !o->next && !o->level);
@@ -87,6 +81,7 @@ public:
     [[nodiscard]] uint32_t size()             const noexcept { return size_;         }
     [[nodiscard]] bool     empty()            const noexcept { return size_ == 0;    }
     [[nodiscard]] double   price()            const noexcept { return price_;        }
+    [[nodiscard]] uint32_t tick()             const noexcept { return tick_;         }
     [[nodiscard]] Order*   front()            const noexcept { return head_;         }
     [[nodiscard]] Order*   back()             const noexcept { return tail_;         }
 
@@ -103,9 +98,9 @@ private:
     Order*   head_         = nullptr;
     Order*   tail_         = nullptr;
     uint32_t size_         = 0;
-    uint32_t _pad_         = 0;
+    uint32_t tick_         = 0;   // index into the owning side's level array
     uint64_t total_volume_ = 0;
-    double   price_;
+    double   price_        = 0.0;
 };
 
 static_assert(sizeof(PriceLevel) <= 64);
