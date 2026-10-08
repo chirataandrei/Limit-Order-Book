@@ -1,0 +1,39 @@
+name: Benchmark (Linux x86)
+
+# Manual only. Shared runners are noisy, so this is for an indicative x86 Linux
+# number, not for regression gating.
+on: workflow_dispatch
+
+permissions:
+  contents: read
+
+jobs:
+  bench:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Machine info
+        run: |
+          uname -a
+          lscpu | grep -E "Model name|^CPU\(s\)|L1d|L2|L3|MHz" || true
+          g++ --version | head -1
+
+      - name: Build
+        run: |
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_COMPILER=g++
+          cmake --build build -j
+
+      - name: Benchmark (3 runs)
+        run: |
+          for i in 1 2 3; do
+            echo "=== run $i ==="
+            taskset -c 1 ./build/lob_bench | grep -A8 SUMMARY
+          done
+
+      - name: perf (best effort)
+        continue-on-error: true
+        run: |
+          sudo apt-get install -y linux-tools-common linux-tools-$(uname -r) >/dev/null 2>&1 || true
+          sudo sysctl -w kernel.perf_event_paranoid=-1 || true
+          perf stat -e cycles,instructions,cache-misses,branch-misses taskset -c 1 ./build/lob_bench 2>&1 | tail -15
