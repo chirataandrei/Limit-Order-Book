@@ -71,14 +71,16 @@ Notes:
 
 Measured by the manual `Benchmark (Linux x86)` workflow (`.github/workflows/bench.yml`) on a GitHub-hosted runner: AMD EPYC 9V45 (4 vCPU VM, 32 MB L3), Ubuntu 24.04, g++ 13.3, `-O2 -march=native`, pinned with `taskset -c 1`. Same code as the last column above, three back-to-back runs:
 
-| Scenario | M4 (macOS) | EPYC VM (Linux x86) |
-|---|---|---|
-| `add_order` — 1M resting | 43 ns | 148–168 ns |
-| `cancel_order` — 500k random | 58 ns | 112–121 ns |
-| `add+match` — 1:1 fill | 111–116 ns | 208–228 ns |
-| sweep (per level) | 17–19 ns | 28–30 ns |
+| Scenario | M4 (macOS) | Linux ARM64 VM on the same Mac | EPYC VM (Linux x86) |
+|---|---|---|---|
+| `add_order` — 1M resting | 43 ns | 100–128 ns | 148–168 ns |
+| `cancel_order` — 500k random | 58 ns | 63–75 ns | 112–121 ns |
+| `add+match` — 1:1 fill | 111–116 ns | 150–191 ns | 208–228 ns |
+| sweep (per level) | 17–19 ns | 29–49 ns | 28–30 ns |
 
-Caveats, because this is not a tuned trading box: it is a shared cloud VM (noisy neighbours, no isolated cores, no huge pages, virtualised memory), and the VM exposes no hardware counters, so `perf stat` reports `<not supported>` and I could not confirm *why* `add_order` is ~3.5× slower than on the M4 (the M4 has far lower memory latency and a much larger cache for this 64 MB + 32 MB working set; first-touch page faults in a VM are the other suspect). Treat these as an upper bound. For `perf record`/cache-miss numbers, run on bare metal:
+The middle column is a Linux (aarch64) guest under Apple Virtualization on the same M4 Mac, three runs, pinned with `taskset -c 2`. It is **not x86**: it isolates the cost of "Linux in a VM" from the cost of the CPU architecture. The x86 column is the GitHub runner only.
+
+Caveats, because this is not a tuned trading box: it is a shared cloud VM (noisy neighbours, no isolated cores, no huge pages, virtualised memory), and neither VM exposes usable hardware counters (`perf stat` reports `<not supported>` on the runner, and `perf_event_paranoid=4` blocks it in the Apple VM) and I could not confirm *why* `add_order` is ~3.5× slower than on the M4 (the M4 has far lower memory latency and a much larger cache for this 64 MB + 32 MB working set; first-touch page faults in a VM are the other suspect). Treat these as an upper bound. For `perf record`/cache-miss numbers, run on bare metal:
 
 ```bash
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release && cmake --build build -j
