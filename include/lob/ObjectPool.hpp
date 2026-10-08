@@ -39,8 +39,8 @@ public:
     ObjectPool& operator=(ObjectPool&&)      = delete;
 
     ~ObjectPool() {
-        ::operator delete(storage_, sizeof(T) * Capacity,
-                          std::align_val_t{alignof(T)});
+        // Unsized form: clang doesn't enable -fsized-deallocation by default.
+        ::operator delete(storage_, std::align_val_t{alignof(T)});
     }
 
     // Construct a T in-place and return a pointer. Returns nullptr on exhaustion
