@@ -9,6 +9,7 @@
 #include <iostream>
 #include <map>
 #include <random>
+#include <unordered_map>
 #include <vector>
 
 #include "OrderBook.hpp"
@@ -347,6 +348,65 @@ int main() {
             }
         }
         std::cout << "  200k random ops, book == reference at every step ✓\n\n";
+    }
+
+    // ── 13. Execution price is the resting order's price ─────────────────────
+    {
+        std::cout << "── 13. Aggressor / execution price ──\n";
+        {   // buy aggressor lifts a resting ask: trades at the ask
+            OrderBook book;
+            (void)book.add_order(1, 10, 100.0, Side::Sell);
+            auto t = book.add_order(2, 10, 105.0, Side::Buy);
+            assert(t.size() == 1 && t[0].price == 100.0 && t[0].aggressor == Side::Buy);
+            assert(t[0].bid_order_id == 2 && t[0].ask_order_id == 1);
+        }
+        {   // sell aggressor hits a resting bid: trades at the bid (was the bug)
+            OrderBook book;
+            (void)book.add_order(1, 10, 105.0, Side::Buy);
+            auto t = book.add_order(2, 10, 100.0, Side::Sell);
+            assert(t.size() == 1 && t[0].price == 105.0 && t[0].aggressor == Side::Sell);
+            assert(t[0].bid_order_id == 1 && t[0].ask_order_id == 2);
+        }
+        {   // sell sweeping several bids: each fill at that bid's price
+            OrderBook book;
+            (void)book.add_order(1, 5, 103.0, Side::Buy);
+            (void)book.add_order(2, 5, 102.0, Side::Buy);
+            auto t = book.add_order(3, 10, 100.0, Side::Sell);
+            assert(t.size() == 2 && t[0].price == 103.0 && t[1].price == 102.0);
+        }
+        std::cout << "  trades print at the maker's price for both aggressor sides ✓\n\n";
+    }
+
+    // ── 14. FlatIdMap vs. std::unordered_map ─────────────────────────────────
+    {
+        std::cout << "── 14. FlatIdMap differential test ──\n";
+        // Tiny table (16 slots) and a small key space force long probe clusters
+        // and plenty of backward-shift deletions that wrap around the end.
+        constexpr int MAX_LIVE = 8;
+        FlatIdMap map(MAX_LIVE);
+        std::unordered_map<uint64_t, Order*> ref;
+        std::vector<Order> store(64);
+        std::mt19937_64 rng(777);
+
+        for (int step = 0; step < 500'000; ++step) {
+            const uint64_t key = rng() % 40 + ((rng() & 1) ? 0 : (uint64_t{1} << 63));
+            Order* const   val = &store[rng() % store.size()];
+            if (ref.count(key)) {
+                if (rng() & 1) { assert(map.erase(key)); ref.erase(key); }
+            } else if (ref.size() < MAX_LIVE) {
+                map.insert(key, val);
+                ref[key] = val;
+            } else {
+                assert(!map.erase(key));
+            }
+            assert(map.size() == ref.size());
+            for (uint64_t k = 0; k < 40; ++k)
+                for (uint64_t hi : {uint64_t{0}, uint64_t{1} << 63}) {
+                    auto it = ref.find(k + hi);
+                    assert(map.find(k + hi) == (it == ref.end() ? nullptr : it->second));
+                }
+        }
+        std::cout << "  500k ops, every key agrees with the reference ✓\n\n";
     }
 
     std::cout << "All assertions passed.\n";

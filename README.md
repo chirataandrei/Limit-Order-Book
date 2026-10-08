@@ -26,6 +26,7 @@ include/lob/
   Order.hpp        – 64-byte cache-line-aligned node, intrusive list pointers + back-pointer
   PriceLevel.hpp   – intrusive doubly-linked FIFO of orders at one price
   TickBitmap.hpp   – hierarchical occupancy bitmap (O(log64 n) lowest/highest set tick)
+  FlatIdMap.hpp    – open-addressing order-id -> Order* table (linear probing, backward-shift delete)
   OrderBook.hpp    – tick-indexed bid/ask level arrays, order-id lookup, add/cancel/match
   Benchmark.hpp    – minimal timing harness (setup/bench/teardown separation, warmup)
 src/main.cpp       – correctness tests
@@ -41,36 +42,50 @@ CMakeLists.txt     – builds lob_tests and lob_bench
 
 **Best bid/ask** — each side caches its best tick. A `TickBitmap` (one bit per tick, plus one summary bit per 64-bit word, recursively) records which levels are non-empty, so when the best level empties the next one is found with one `ctz`/`clz` per bitmap level (4 steps for 1M ticks) instead of a scan.
 
+**Order ids** — `FlatIdMap` is a flat 16-byte-per-slot open-addressing table (2M slots = 32 MB, load ≤ 0.5 because the pool caps live orders), Fibonacci hash, linear probing, backward-shift deletion so there are no tombstones. It replaced `std::unordered_map`, which costs a heap node and a pointer chase per entry.
+
 **Intrusive list** — `Order` carries its own `prev`/`next` pointers, so `PriceLevel::remove()` is O(1) with no search. The `level` back-pointer lets `cancel_order()` go straight from order ID → `Order*` → `PriceLevel*` → intrusive remove, with no price lookup at all.
 
-**Matching** — `match_()` is called inside `add_order()`. It loops while `best_bid >= best_ask`, pops the front of each queue (FIFO priority), fills them, and cleans up any exhausted levels. Execution price is the resting side's price.
+**Matching** — `match_()` is called inside `add_order()`. It loops while `best_bid >= best_ask`, pops the front of each queue (FIFO priority), fills them, and cleans up any exhausted levels. Execution price is the resting (maker) order's price: `add_order()` matches after every insert, so the book is never crossed on entry and the aggressor is always the order just added. Each `Trade` records its `aggressor` side; a buy that lifts an ask trades at the ask, a sell that hits a bid trades at the bid.
 
 ## Benchmark results
 
-`std::map<double, PriceLevel>` → tick-indexed array, same benchmarks, same machine, run back to back.  
-Apple M4, Apple clang 16, `-O2 -mcpu=native`, `steady_clock`. Warmup: 3 iterations, samples: 10 iterations. Mean ns/op, two runs each (run-to-run variation up to ~10%).
+Apple M4, Apple clang 16, `-O2 -march=native`, `steady_clock`. Warmup: 3 iterations, samples: 10 iterations. Mean ns/op, run-to-run variation up to ~10%. Each column changes one thing, same machine, run back to back.
 
-| Scenario | `std::map` | tick array | |
+| Scenario | `std::map` levels + `unordered_map` ids | tick array + `unordered_map` | tick array + `FlatIdMap` |
 |---|---|---|---|
-| `add_order` — 1M resting orders, each opening a new level | 65 ns | 30 ns | 2.2× |
-| `cancel_order` — 500k random cancels | 540–590 ns | 225 ns | 2.4× |
-| `add+match` — 500k aggressive orders, 1:1 fill | 133 ns | 105–111 ns | 1.2× |
-| sweep — 1 order clearing 1 000 price levels | 56 ns/level | 33 ns/level | 1.7× |
+| `add_order` — 1M resting orders, each opening a new level | 65 ns | 30 ns | 43 ns |
+| `cancel_order` — 500k random cancels | 540–590 ns | 225–250 ns | 58 ns |
+| `add+match` — 500k aggressive orders, 1:1 fill | 133 ns | 105–111 ns | 111–116 ns |
+| sweep — 1 order clearing 1 000 price levels | 56 ns/level | 31–33 ns/level | 17–19 ns/level |
 
 Notes:
 
-- The `add_order` benchmark opens a brand-new level on every insert, which is the worst case for a tree (1M nodes, 1M allocations) and the best case for an array. `add+match` only ever touches one price, so the old tree was tiny and cache-resident; that is why it moves least.
-- `cancel_order` also gains because cancelling the last order at a level used to be a tree erase; now it clears a bit.
-- The tick array trades memory for speed: 40 B per tick per side, allocated up front (a 1M-tick grid is 40 MB per side).
-- The first version of this README quoted 268 ns for `add_order` from a Linux VM. On this machine the same code measured 65 ns, so absolute numbers do not transfer between machines; compare the columns, not the rows against old figures.
+- **Cancel is 4× faster with `FlatIdMap`** (240 → 58 ns): cancel is dominated by the id lookup, and the shuffled ids made every `unordered_map` lookup a bucket miss plus a node miss. Sweep also gets ~1.8× faster because each fill erases two ids.
+- **`add_order` got slower (30 → 43 ns)**, and that is real. The benchmark inserts sequential ids; `unordered_map` hashes `uint64` as the identity, so consecutive ids hit consecutive buckets and consecutive nodes — cache-friendly by accident. A multiplicative hash scatters them over 32 MB, so every insert is a cache miss. I tried an identity hash in `FlatIdMap` to get that locality back; it clustered catastrophically as soon as two id ranges overlapped modulo the table size (the 1:1 match benchmark went from ~100 ns to minutes), so it is not used. `add+match` is flat for the same reason: it is dominated by other work.
+- The 30 ns `add_order` figure was the best case: every insert opens a brand-new level and ids are perfectly sequential, so nothing misses cache. Real flow mostly adds to existing levels and has non-sequential ids, so treat 43 ns as the more honest number for that benchmark and `add+match` (~110 ns) as the realistic hot path.
+- The tick array trades memory for speed: 40 B per tick per side, allocated up front (a 1M-tick grid is 40 MB per side); `FlatIdMap` is another 32 MB.
+- Absolute numbers do not transfer between machines (an earlier version of this README quoted 268 ns for `add_order` from a Linux VM; the same code did 65 ns here). Compare columns, not rows against old figures.
+
+### Linux x86
+
+**Not measured yet.** Trading firms run Linux on x86, so this is the number an interviewer will ask for, and it should be filled in from a real x86 machine (bare metal or a dedicated cloud VM, not a shared CI runner and not an emulated container):
+
+```bash
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release && cmake --build build -j
+taskset -c 2 ./build/lob_bench                      # pin to one core
+perf stat -e cycles,instructions,cache-misses,branch-misses taskset -c 2 ./build/lob_bench
+perf record -g taskset -c 2 ./build/lob_bench && perf report   # confirm where cancel/add time goes
+```
+
+The `FlatIdMap` change above was driven by reasoning about the access pattern and before/after timings on macOS; it has not been profiled with `perf` yet.
 
 ## Known limitations / next steps
 
 - **Fixed price grid** — the price range is fixed at construction. A book that needs to follow a drifting market has to re-centre or size the grid generously.
-- **`order_map_` is still `std::unordered_map`** — it is probably the largest remaining cost in `add_order` and `cancel_order` (not profiled yet). A flat open-addressing table (or direct-indexed ids) is the next step.
+- **`FlatIdMap` is fixed-capacity and hash-scattered** — it is sized once from the pool capacity and never grows, and its hash trades `add_order` locality for robustness against any id pattern (see benchmark notes). Direct-indexed ids (when the exchange guarantees a dense range) would beat it.
 - **`double` prices at the API** — prices are snapped to integer ticks internally, but callers still pass `double`. An integer-tick API would remove the conversion.
 - **No thread safety** — single-threaded by design. Adding a lock-free cancel path via `std::atomic<FreeNode*>` CAS is the next concurrency step.
-- **Trade price convention** — execution always at ask price. A proper exchange needs to track which order was the aggressor.
 - **No market orders** — straightforward to add: submit with price = `±infinity` and let `match_()` do the rest.
 
 ## Author

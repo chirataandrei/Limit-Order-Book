@@ -1,6 +1,7 @@
 #pragma once
 
 #include "ObjectPool.hpp"
+#include "FlatIdMap.hpp"
 #include "Order.hpp"
 #include "PriceLevel.hpp"
 #include "TickBitmap.hpp"
@@ -13,7 +14,6 @@
 #include <limits>
 #include <memory>
 #include <stdexcept>
-#include <unordered_map>
 #include <vector>
 
 namespace lob {
@@ -24,6 +24,7 @@ struct Trade {
     uint64_t quantity;
     double   price;      // execution at the resting (maker) side's price
     uint64_t timestamp;
+    Side     aggressor;  // side of the incoming order that triggered the trade
 };
 
 // Price grid: level i sits at min_price + i * tick_size. Orders must land
@@ -42,11 +43,10 @@ public:
 
     explicit OrderBook(BookConfig cfg = {})
         : min_price_(cfg.min_price), tick_size_(cfg.tick_size), num_ticks_(cfg.num_ticks),
-          bids_(cfg), asks_(cfg)
+          order_map_(POOL_CAPACITY), bids_(cfg), asks_(cfg)
     {
         if (!(cfg.tick_size > 0.0) || cfg.num_ticks == 0 || !std::isfinite(cfg.min_price))
             throw std::invalid_argument("invalid BookConfig");
-        order_map_.reserve(POOL_CAPACITY);
     }
 
     OrderBook(const OrderBook&)            = delete;
@@ -77,10 +77,10 @@ public:
         if (lvl.empty()) occupy_(s, tick, side == Side::Buy);
         lvl.push_back(o);
 
-        order_map_.emplace(id, o);
+        order_map_.insert(id, o);
 
         std::vector<Trade> trades;
-        match_(trades);
+        match_(trades, side);
         return trades;
     }
 
@@ -88,15 +88,14 @@ public:
     // level goes empty, the bitmap update is O(log64 P) – at most one extra
     // descent when it was the best level.
     bool cancel_order(uint64_t id) noexcept {
-        auto it = order_map_.find(id);
-        if (it == order_map_.end()) return false;
+        Order* o = order_map_.find(id);
+        if (!o) return false;
 
-        Order*      o   = it->second;
         PriceLevel* lvl = o->level;
         assert(lvl);
 
         lvl->remove(o);
-        order_map_.erase(it);
+        order_map_.erase(id);
 
         if (lvl->empty()) {
             if (o->side == Side::Buy) release_(bids_, lvl->tick(), true);
@@ -152,10 +151,10 @@ private:
     double   tick_size_;
     uint32_t num_ticks_;
 
-    ObjectPool<Order, POOL_CAPACITY>     pool_;
-    LevelArray                           bids_;
-    LevelArray                           asks_;
-    std::unordered_map<uint64_t, Order*> order_map_;
+    ObjectPool<Order, POOL_CAPACITY> pool_;
+    FlatIdMap                        order_map_;   // declared before bids_/asks_: matches ctor init order
+    LevelArray                       bids_;
+    LevelArray                       asks_;
 
     [[nodiscard]] uint32_t tick_of_(double price) const {
         const double raw = (price - min_price_) / tick_size_;
@@ -186,7 +185,7 @@ private:
                                                   : s.occupied.lowest());
     }
 
-    void match_(std::vector<Trade>& out) {
+    void match_(std::vector<Trade>& out, Side aggressor) {
         while (bids_.count && asks_.count) {
             const uint32_t bt = bids_.best;
             const uint32_t at = asks_.best;
@@ -200,10 +199,11 @@ private:
 
             const uint64_t qty = std::min(bo->quantity, ao->quantity);
 
-            // Execution price = resting ask (maker side).
-            // If the sell was the aggressor, we'd want bid price instead –
-            // for now this is fine since we don't track aggressor vs. resting.
-            out.push_back({ bo->id, ao->id, qty, alvl.price(), now_ns() });
+            // Execution price = the resting (maker) order's price. add_order()
+            // matches after every insert, so the book is never crossed on
+            // entry and the aggressor is always the order just added.
+            const double px = (aggressor == Side::Buy) ? alvl.price() : blvl.price();
+            out.push_back({ bo->id, ao->id, qty, px, now_ns(), aggressor });
 
             if (bo->quantity == qty) {
                 blvl.remove(bo);
