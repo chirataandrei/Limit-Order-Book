@@ -29,10 +29,10 @@ static void print_top(const OrderBook& book) {
     auto* bid = book.best_bid();
     auto* ask = book.best_ask();
     std::cout << "  TOP  bid=";
-    if (bid) std::cout << bid->price() << " vol=" << bid->get_total_volume();
+    if (bid) std::cout << book.price_of(*bid) << " vol=" << bid->get_total_volume();
     else     std::cout << "–";
     std::cout << "  ask=";
-    if (ask) std::cout << ask->price() << " vol=" << ask->get_total_volume();
+    if (ask) std::cout << book.price_of(*ask) << " vol=" << ask->get_total_volume();
     else     std::cout << "–";
     std::cout << "  spread=" << book.spread()
               << "  mid="    << book.mid_price()
@@ -264,8 +264,8 @@ int main() {
 
         (void)book.add_order(1, 1, 10.0,  Side::Buy);    // first tick
         (void)book.add_order(2, 1, 34.75, Side::Sell);   // last tick
-        assert(book.best_bid()->price() == 10.0);
-        assert(book.best_ask()->price() == 34.75);
+        assert(book.price_of(*book.best_bid()) == 10.0);
+        assert(book.price_of(*book.best_ask()) == 34.75);
         std::cout << "  off-grid / out-of-range rejected, edges accepted ✓\n\n";
     }
 
@@ -284,9 +284,9 @@ int main() {
 
         // Walk the best bid down by cancelling both orders at each level.
         for (int i = 6; i >= 0; --i) {
-            assert(book.best_bid()->price() == px[i]);
+            assert(book.price_of(*book.best_bid()) == px[i]);
             assert(book.cancel_order(1 + i));
-            assert(book.best_bid()->price() == px[i]);          // one order left
+            assert(book.price_of(*book.best_bid()) == px[i]);          // one order left
             assert(book.cancel_order(8 + i));
         }
         assert(book.best_bid() == nullptr && book.bid_levels() == 0);
@@ -294,11 +294,11 @@ int main() {
         // Asks: best is the lowest tick; a sweep must advance it level by level.
         id = 100;
         for (double p : px) (void)book.add_order(id++, 1, p, Side::Sell);
-        assert(book.best_ask()->price() == 3);
+        assert(book.price_of(*book.best_ask()) == 3);
         auto t = book.add_order(200, 3, 64.0, Side::Buy);       // takes 3 and 64, rests 1
         assert(t.size() == 2 && t[0].price == 3 && t[1].price == 64);
-        assert(book.best_ask()->price() == 4095);
-        assert(book.best_bid()->price() == 64 && book.best_bid()->get_total_volume() == 1);
+        assert(book.price_of(*book.best_ask()) == 4095);
+        assert(book.price_of(*book.best_bid()) == 64 && book.best_bid()->get_total_volume() == 1);
         std::cout << "  best bid/ask correct across word boundaries ✓\n\n";
     }
 
@@ -338,12 +338,12 @@ int main() {
             assert(book.ask_levels()  == ref_ask.size());
             if (ref_bid.empty()) assert(!book.best_bid());
             else {
-                assert(book.best_bid()->price() == ref_bid.rbegin()->first);
+                assert(book.price_of(*book.best_bid()) == ref_bid.rbegin()->first);
                 assert(book.best_bid()->get_total_volume() == ref_bid.rbegin()->second);
             }
             if (ref_ask.empty()) assert(!book.best_ask());
             else {
-                assert(book.best_ask()->price() == ref_ask.begin()->first);
+                assert(book.price_of(*book.best_ask()) == ref_ask.begin()->first);
                 assert(book.best_ask()->get_total_volume() == ref_ask.begin()->second);
             }
         }

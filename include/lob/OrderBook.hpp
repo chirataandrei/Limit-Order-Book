@@ -112,13 +112,17 @@ public:
     [[nodiscard]] const PriceLevel* best_ask() const noexcept {
         return asks_.count ? &asks_.levels[asks_.best] : nullptr;
     }
+    // Level price is derived from its tick; levels store only the integer index.
+    [[nodiscard]] double price_of(const PriceLevel& l) const noexcept {
+        return min_price_ + static_cast<double>(l.tick()) * tick_size_;
+    }
     [[nodiscard]] double mid_price() const noexcept {
         if (!bids_.count || !asks_.count) return 0.0;
-        return (bids_.levels[bids_.best].price() + asks_.levels[asks_.best].price()) * 0.5;
+        return (price_of(bids_.levels[bids_.best]) + price_of(asks_.levels[asks_.best])) * 0.5;
     }
     [[nodiscard]] double spread() const noexcept {
         if (!bids_.count || !asks_.count) return 0.0;
-        return asks_.levels[asks_.best].price() - bids_.levels[bids_.best].price();
+        return price_of(asks_.levels[asks_.best]) - price_of(bids_.levels[bids_.best]);
     }
 
     [[nodiscard]] std::size_t bid_levels()  const noexcept { return bids_.count;       }
@@ -143,7 +147,7 @@ private:
               occupied(cfg.num_ticks)
         {
             for (uint32_t i = 0; i < cfg.num_ticks; ++i)
-                levels[i].init(cfg.min_price + static_cast<double>(i) * cfg.tick_size, i);
+                levels[i].init(i);
         }
     };
 
@@ -202,7 +206,7 @@ private:
             // Execution price = the resting (maker) order's price. add_order()
             // matches after every insert, so the book is never crossed on
             // entry and the aggressor is always the order just added.
-            const double px = (aggressor == Side::Buy) ? alvl.price() : blvl.price();
+            const double px = (aggressor == Side::Buy) ? price_of(alvl) : price_of(blvl);
             out.push_back({ bo->id, ao->id, qty, px, now_ns(), aggressor });
 
             if (bo->quantity == qty) {
