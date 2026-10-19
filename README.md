@@ -38,7 +38,7 @@ CMakeLists.txt     – builds lob_sim, lob_tests and lob_bench
 
 ## How it works
 
-**Memory** — `OrderPool(1'000'000)` grabs 64 MB once at startup. Every `add_order` pops from a free list; every `cancel_order` or fill pushes back. No heap traffic on the hot path.
+**Memory** — `OrderPool(1'000'000)` grabs 64 MB once at startup. Every `add_order` pops from a free list; every `cancel_order` or fill pushes back. The pool, the id map and the level arrays are all allocated up front, so resting, cancelling and matching never touch the heap, as long as the caller's trade buffer has reached its working capacity (see Trade output).
 
 **Price levels** — each side is a dense `PriceLevel[]` indexed by tick: level `i` sits at `min_price + i * tick_size`, set through `BookConfig{min_price, tick_size, num_ticks}` (default grid is 0.00–999.99 in 0.01 steps). `add_order` converts the price to a tick once and then indexes straight into the array — O(1), no tree walk, no node allocation. Prices off the grid or outside it throw `std::invalid_argument`.
 
@@ -47,6 +47,8 @@ CMakeLists.txt     – builds lob_sim, lob_tests and lob_bench
 **Order ids** — `FlatIdMap` is a flat 16-byte-per-slot open-addressing table (2M slots = 32 MB, load ≤ 0.5 because the pool caps live orders), Fibonacci hash, linear probing, backward-shift deletion so there are no tombstones. It replaced `std::unordered_map`, which costs a heap node and a pointer chase per entry.
 
 **Intrusive list** — `Order` carries its own `prev`/`next` pointers, so `PriceLevel::remove()` is O(1) with no search. The `level` back-pointer lets `cancel_order()` go straight from order ID → `Order*` → `PriceLevel*` → intrusive remove, with no price lookup at all.
+
+**Trade output** — `add_order(id, qty, price, side, out)` appends the generated `Trade`s to a caller-owned `std::vector<Trade>` and returns nothing. `clear()` the buffer between calls and its capacity is reused, so matching does no heap allocation once the buffer has grown to the working size. There is deliberately no overload that returns a vector: it would allocate on every trade and make the no-heap guarantee easy to lose by accident. Tests wrap the call in a small helper that builds a fresh vector. Returning the trades by value instead cost about 25 ns on `add+match` on the M4 (~101 ns vs ~75–83 ns) and ~1 ns/level on the sweep.
 
 **Matching** — `match_()` is called inside `add_order()`. It loops while `best_bid >= best_ask`, pops the front of each queue (FIFO priority), fills them, and cleans up any exhausted levels. Execution price is the resting (maker) order's price: `add_order()` matches after every insert, so the book is never crossed on entry and the aggressor is always the order just added. Each `Trade` records its `aggressor` side; a buy that lifts an ask trades at the ask, a sell that hits a bid trades at the bid.
 
@@ -65,24 +67,26 @@ Time is simulated and passed to `add_order` as nanosecond timestamps. The run pr
 
 Apple M4, Apple clang 16, `-O2 -march=native`, `steady_clock`. Warmup: 3 iterations, samples: 10 iterations. Mean ns/op, run-to-run variation up to ~10%. Each column changes one thing, same machine, run back to back.
 
-| Scenario | `std::map` levels + `unordered_map` ids | tick array + `unordered_map` | tick array + `FlatIdMap` |
-|---|---|---|---|
-| `add_order` — 1M resting orders, each opening a new level | 65 ns | 30 ns | 43 ns |
-| `cancel_order` — 500k random cancels | 540–590 ns | 225–250 ns | 58 ns |
-| `add+match` — 500k aggressive orders, 1:1 fill | 133 ns | 105–111 ns | 111–116 ns |
-| sweep — 1 order clearing 1 000 price levels | 56 ns/level | 31–33 ns/level | 17–19 ns/level |
+| Scenario | `std::map` levels + `unordered_map` ids | tick array + `unordered_map` | tick array + `FlatIdMap` | + caller-owned trade buffer |
+|---|---|---|---|---|
+| `add_order` — 1M resting orders, each opening a new level | 65 ns | 30 ns | 39–40 ns | 38–42 ns |
+| `cancel_order` — 500k random cancels | 540–590 ns | 225–250 ns | 55–56 ns | 58–62 ns |
+| `add+match` — 500k aggressive orders, 1:1 fill | 133 ns | 105–111 ns | 99–105 ns | 69–86 ns |
+| sweep — 1 order clearing 1 000 price levels | 56 ns/level | 31–33 ns/level | 17 ns/level | 15–17 ns/level |
+
+The first two columns are the original measurements from earlier versions of the code; the last two were re-measured together on the current tree (5–6 back-to-back runs each), so the `FlatIdMap` column differs slightly from older versions of this README (43 / 58 / 111–116 / 17–19) because the machine and tree moved on. The last column is the only change between the two: `add_order` appends to a reused `std::vector<Trade>` instead of returning a fresh one. Matching benchmarks gain the most because every trade used to allocate; the cases with no trades (`add_order`, `cancel_order`) do not change.
 
 Notes:
 
-- **Cancel is 4× faster with `FlatIdMap`** (240 → 58 ns): cancel is dominated by the id lookup, and the shuffled ids made every `unordered_map` lookup a bucket miss plus a node miss. Sweep also gets ~1.8× faster because each fill erases two ids.
-- **`add_order` got slower (30 → 43 ns)**, and that is real. The benchmark inserts sequential ids; `unordered_map` hashes `uint64` as the identity, so consecutive ids hit consecutive buckets and consecutive nodes — cache-friendly by accident. A multiplicative hash scatters them over 32 MB, so every insert is a cache miss. I tried an identity hash in `FlatIdMap` to get that locality back; it clustered catastrophically as soon as two id ranges overlapped modulo the table size (the 1:1 match benchmark went from ~100 ns to minutes), so it is not used. `add+match` is flat for the same reason: it is dominated by other work.
-- The 30 ns `add_order` figure was the best case: every insert opens a brand-new level and ids are perfectly sequential, so nothing misses cache. Real flow mostly adds to existing levels and has non-sequential ids, so treat 43 ns as the more honest number for that benchmark and `add+match` (~110 ns) as the realistic hot path.
+- **Cancel is 4× faster with `FlatIdMap`** (240 → 58 ns): cancel is dominated by the id lookup, and the shuffled ids made every `unordered_map` lookup a bucket miss plus a node miss. Sweep also gets ~1.8× faster because each fill erases two ids; the caller-owned trade buffer then takes `add+match` from ~100 to ~75 ns.
+- **`add_order` got slower (30 → ~40 ns)**, and that is real. The benchmark inserts sequential ids; `unordered_map` hashes `uint64` as the identity, so consecutive ids hit consecutive buckets and consecutive nodes — cache-friendly by accident. A multiplicative hash scatters them over 32 MB, so every insert is a cache miss. I tried an identity hash in `FlatIdMap` to get that locality back; it clustered catastrophically as soon as two id ranges overlapped modulo the table size (the 1:1 match benchmark went from ~100 ns to minutes), so it is not used. `add+match` is flat for the same reason: it is dominated by other work.
+- The 30 ns `add_order` figure was the best case: every insert opens a brand-new level and ids are perfectly sequential, so nothing misses cache. Real flow mostly adds to existing levels and has non-sequential ids, so treat ~40 ns as the more honest number for that benchmark and `add+match` (~75 ns with the caller-owned buffer, ~100 ns when returning a vector) as the realistic hot path.
 - The tick array trades memory for speed: 40 B per tick per side, allocated up front (a 1M-tick grid is 40 MB per side); `FlatIdMap` is another 32 MB.
 - Absolute numbers do not transfer between machines (an earlier version of this README quoted 268 ns for `add_order` from a Linux VM; the same code did 65 ns here). Compare columns, not rows against old figures.
 
 ### Linux x86
 
-Measured by the manual `Benchmark (Linux x86)` workflow (`.github/workflows/bench.yml`) on a GitHub-hosted runner: AMD EPYC 9V45 (4 vCPU VM, 32 MB L3), Ubuntu 24.04, g++ 13.3, `-O2 -march=native`, pinned with `taskset -c 1`. Same code as the last column above, three back-to-back runs:
+Measured by the manual `Benchmark (Linux x86)` workflow (`.github/workflows/bench.yml`) on a GitHub-hosted runner: AMD EPYC 9V45 (4 vCPU VM, 32 MB L3), Ubuntu 24.04, g++ 13.3, `-O2 -march=native`, pinned with `taskset -c 1`. Same code as the `FlatIdMap` column above (before the caller-owned trade buffer, so the M4 column here is the older 43 / 58 / 111–116 / 17–19 ns run, not the table above), three back-to-back runs:
 
 | Scenario | M4 (macOS) | Linux ARM64 VM on the same Mac | EPYC VM (Linux x86) |
 |---|---|---|---|

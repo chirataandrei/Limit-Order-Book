@@ -15,6 +15,15 @@
 
 using namespace lob;
 
+// OrderBook::add_order appends trades to a caller-owned buffer; the tests want
+// a fresh vector per call, so they go through this wrapper.
+static std::vector<Trade> add(OrderBook &book, uint64_t id, uint64_t qty, double px, Side side)
+{
+    std::vector<Trade> trades;
+    book.add_order(id, qty, px, side, trades);
+    return trades;
+}
+
 // ── helpers ──────────────────────────────────────────────────────────────────
 static void print_trade(const Trade& t) {
     std::cout << "  TRADE  bid=" << t.bid_order_id
@@ -45,11 +54,11 @@ int main() {
         std::cout << "── 1. Full fill ──\n";
         OrderBook book;
 
-        auto t1 = book.add_order(1, 100, 100.0, Side::Sell);   // resting ask
+        auto t1 = add(book, 1, 100, 100.0, Side::Sell);   // resting ask
         assert(t1.empty());                                      // no match yet
         print_top(book);
 
-        auto t2 = book.add_order(2, 100, 100.0, Side::Buy);    // aggressive buy
+        auto t2 = add(book, 2, 100, 100.0, Side::Buy);    // aggressive buy
         assert(t2.size() == 1);
         assert(t2[0].quantity == 100 && t2[0].price == 100.0);
         for (auto& t : t2) print_trade(t);
@@ -66,11 +75,11 @@ int main() {
         OrderBook book;
 
         // Resting ask: 30 @ 99
-        auto t1 = book.add_order(1, 30, 99.0, Side::Sell);
+        auto t1 = add(book, 1, 30, 99.0, Side::Sell);
         assert(t1.empty());
 
         // Aggressive buy 100 @ 99 → fills 30, remaining 70 rests as bid
-        auto t2 = book.add_order(2, 100, 99.0, Side::Buy);
+        auto t2 = add(book, 2, 100, 99.0, Side::Buy);
         assert(t2.size()          == 1);
         assert(t2[0].quantity     == 30);
         assert(t2[0].ask_order_id == 1);
@@ -90,13 +99,13 @@ int main() {
         OrderBook book;
 
         // Resting asks at three levels
-        (void)book.add_order(1, 50,  100.0, Side::Sell);
-        (void)book.add_order(2, 50,  101.0, Side::Sell);
-        (void)book.add_order(3, 50,  102.0, Side::Sell);
+        (void)add(book, 1, 50,  100.0, Side::Sell);
+        (void)add(book, 2, 50,  101.0, Side::Sell);
+        (void)add(book, 3, 50,  102.0, Side::Sell);
         print_top(book);
 
         // Aggressive buy that sweeps all three levels
-        auto trades = book.add_order(4, 150, 102.0, Side::Buy);
+        auto trades = add(book, 4, 150, 102.0, Side::Buy);
         assert(trades.size() == 3);
         assert(trades[0].price == 100.0);   // best ask first
         assert(trades[1].price == 101.0);
@@ -114,9 +123,9 @@ int main() {
         std::cout << "── 4. Cancel ──\n";
         OrderBook book;
 
-        (void)book.add_order(10, 200, 50.0, Side::Buy);    // level with 200
-        (void)book.add_order(11, 300, 50.0, Side::Buy);    // same level → 500 total
-        (void)book.add_order(12, 100, 50.0, Side::Buy);
+        (void)add(book, 10, 200, 50.0, Side::Buy);    // level with 200
+        (void)add(book, 11, 300, 50.0, Side::Buy);    // same level → 500 total
+        (void)add(book, 12, 100, 50.0, Side::Buy);
         print_top(book);
 
         assert(book.cancel_order(11));               // remove middle order
@@ -144,10 +153,10 @@ int main() {
         std::cout << "── 6. FIFO priority ──\n";
         OrderBook book;
 
-        (void)book.add_order(20, 40, 75.0, Side::Sell);   // order 20 is first (head)
-        (void)book.add_order(21, 60, 75.0, Side::Sell);   // order 21 is second
+        (void)add(book, 20, 40, 75.0, Side::Sell);   // order 20 is first (head)
+        (void)add(book, 21, 60, 75.0, Side::Sell);   // order 21 is second
 
-        auto trades = book.add_order(22, 40, 75.0, Side::Buy);
+        auto trades = add(book, 22, 40, 75.0, Side::Buy);
         // Should fill against order 20 first (FIFO)
         assert(trades.size() == 1);
         assert(trades[0].ask_order_id == 20);
@@ -165,10 +174,10 @@ int main() {
     {
         std::cout << "── 7. Duplicate ID rejection ──\n";
         OrderBook book;
-        (void)book.add_order(30, 100, 80.0, Side::Buy);
+        (void)add(book, 30, 100, 80.0, Side::Buy);
 
         bool threw = false;
-        try { (void)book.add_order(30, 50, 81.0, Side::Buy); }
+        try { (void)add(book, 30, 50, 81.0, Side::Buy); }
         catch (const std::invalid_argument&) { threw = true; }
         assert(threw);
         std::cout << "  duplicate id=30 rejected ✓\n\n";
@@ -178,8 +187,8 @@ int main() {
     {
         std::cout << "── 8. Mid-price / spread ──\n";
         OrderBook book;
-        (void)book.add_order(40, 10, 99.0,  Side::Buy);
-        (void)book.add_order(41, 10, 101.0, Side::Sell);
+        (void)add(book, 40, 10, 99.0,  Side::Buy);
+        (void)add(book, 41, 10, 101.0, Side::Sell);
 
         assert(book.spread()    == 2.0);
         assert(book.mid_price() == 100.0);
@@ -193,7 +202,7 @@ int main() {
         OrderBook book(BookConfig{ .min_price = 10.0, .tick_size = 0.25, .num_ticks = 100 });
 
         auto rejects = [&](double px) {
-            try { (void)book.add_order(1, 1, px, Side::Buy); }
+            try { (void)add(book, 1, 1, px, Side::Buy); }
             catch (const std::invalid_argument&) { return true; }
             return false;
         };
@@ -203,8 +212,8 @@ int main() {
         assert(rejects(std::nan("")));
         assert(book.order_count() == 0 && book.pool_used() == 0);   // nothing leaked
 
-        (void)book.add_order(1, 1, 10.0,  Side::Buy);    // first tick
-        (void)book.add_order(2, 1, 34.75, Side::Sell);   // last tick
+        (void)add(book, 1, 1, 10.0,  Side::Buy);    // first tick
+        (void)add(book, 2, 1, 34.75, Side::Sell);   // last tick
         assert(book.price_of(*book.best_bid()) == 10.0);
         assert(book.price_of(*book.best_ask()) == 34.75);
         std::cout << "  off-grid / out-of-range rejected, edges accepted ✓\n\n";
@@ -219,8 +228,8 @@ int main() {
         const double px[] = { 3, 64, 4095, 4096, 262143, 262144, 999'999 };
 
         uint64_t id = 1;
-        for (double p : px) (void)book.add_order(id++, 1, p, Side::Buy);   // ids 1..7
-        for (double p : px) (void)book.add_order(id++, 1, p, Side::Buy);   // ids 8..14, same levels
+        for (double p : px) (void)add(book, id++, 1, p, Side::Buy);   // ids 1..7
+        for (double p : px) (void)add(book, id++, 1, p, Side::Buy);   // ids 8..14, same levels
         assert(book.bid_levels() == 7 && book.order_count() == 14);
 
         // Walk the best bid down by cancelling both orders at each level.
@@ -234,9 +243,9 @@ int main() {
 
         // Asks: best is the lowest tick; a sweep must advance it level by level.
         id = 100;
-        for (double p : px) (void)book.add_order(id++, 1, p, Side::Sell);
+        for (double p : px) (void)add(book, id++, 1, p, Side::Sell);
         assert(book.price_of(*book.best_ask()) == 3);
-        auto t = book.add_order(200, 3, 64.0, Side::Buy);       // takes 3 and 64, rests 1
+        auto t = add(book, 200, 3, 64.0, Side::Buy);       // takes 3 and 64, rests 1
         assert(t.size() == 2 && t[0].price == 3 && t[1].price == 64);
         assert(book.price_of(*book.best_ask()) == 4095);
         assert(book.price_of(*book.best_bid()) == 64 && book.best_bid()->get_total_volume() == 1);
@@ -261,7 +270,7 @@ int main() {
                 const Side     side = (rng() & 1) ? Side::Buy : Side::Sell;
                 const double   px   = static_cast<double>(rng() % 10'000) + (side == Side::Sell ? 10'000 : 0);
                 const uint64_t q    = 1 + rng() % 50;
-                assert(book.add_order(next_id, q, px, side).empty());
+                assert(add(book, next_id, q, px, side).empty());
                 (side == Side::Buy ? ref_bid : ref_ask)[px] += q;
                 live[next_id++] = { px, q, side };
             } else {
@@ -296,23 +305,23 @@ int main() {
         std::cout << "── 13. Aggressor / execution price ──\n";
         {   // buy aggressor lifts a resting ask: trades at the ask
             OrderBook book;
-            (void)book.add_order(1, 10, 100.0, Side::Sell);
-            auto t = book.add_order(2, 10, 105.0, Side::Buy);
+            (void)add(book, 1, 10, 100.0, Side::Sell);
+            auto t = add(book, 2, 10, 105.0, Side::Buy);
             assert(t.size() == 1 && t[0].price == 100.0 && t[0].aggressor == Side::Buy);
             assert(t[0].bid_order_id == 2 && t[0].ask_order_id == 1);
         }
         {   // sell aggressor hits a resting bid: trades at the bid (was the bug)
             OrderBook book;
-            (void)book.add_order(1, 10, 105.0, Side::Buy);
-            auto t = book.add_order(2, 10, 100.0, Side::Sell);
+            (void)add(book, 1, 10, 105.0, Side::Buy);
+            auto t = add(book, 2, 10, 100.0, Side::Sell);
             assert(t.size() == 1 && t[0].price == 105.0 && t[0].aggressor == Side::Sell);
             assert(t[0].bid_order_id == 1 && t[0].ask_order_id == 2);
         }
         {   // sell sweeping several bids: each fill at that bid's price
             OrderBook book;
-            (void)book.add_order(1, 5, 103.0, Side::Buy);
-            (void)book.add_order(2, 5, 102.0, Side::Buy);
-            auto t = book.add_order(3, 10, 100.0, Side::Sell);
+            (void)add(book, 1, 5, 103.0, Side::Buy);
+            (void)add(book, 2, 5, 102.0, Side::Buy);
+            auto t = add(book, 3, 10, 100.0, Side::Sell);
             assert(t.size() == 2 && t[0].price == 103.0 && t[1].price == 102.0);
         }
         std::cout << "  trades print at the maker's price for both aggressor sides ✓\n\n";
@@ -348,6 +357,29 @@ int main() {
                 }
         }
         std::cout << "  500k ops, every key agrees with the reference ✓\n\n";
+    }
+
+    // ── 15. Caller-owned trade buffer ────────────────────────────────────────
+    {
+        std::cout << "── 15. Trade buffer overload ──\n";
+        OrderBook book;
+        std::vector<Trade> buf;
+        (void)add(book, 1, 5, 100.0, Side::Sell);
+        (void)add(book, 2, 5, 101.0, Side::Sell);
+
+        book.add_order(3, 8, 101.0, Side::Buy, buf); // sweeps both levels
+        assert(buf.size() == 2 && buf[0].price == 100.0 && buf[1].price == 101.0);
+        assert(buf[0].quantity == 5 && buf[1].quantity == 3);
+
+        const auto cap = buf.capacity();
+        buf.clear();
+        book.add_order(4, 2, 101.0, Side::Buy, buf); // matches the last 2 of order 2
+        assert(buf.size() == 1 && buf[0].ask_order_id == 2 && buf[0].quantity == 2);
+        assert(buf.capacity() == cap); // reused, not reallocated
+
+        book.add_order(5, 1, 50.0, Side::Buy, buf); // rests: nothing is appended
+        assert(buf.size() == 1);
+        std::cout << "  appends to caller's vector, capacity reused ✓\n\n";
     }
 
     std::cout << "All assertions passed.\n";

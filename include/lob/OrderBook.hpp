@@ -179,11 +179,11 @@ namespace lob
 		OrderBook(OrderBook &&) = delete;
 		OrderBook &operator=(OrderBook &&) = delete;
 
-		// Insert a limit order and attempt immediate matching.
-		// Returns whatever trades were generated (may be empty if the order rests).
-		[[nodiscard]]
-		std::vector<Trade> add_order(uint64_t id, uint64_t quantity,
-									 double price, Side side, uint64_t timestamp = 0)
+		// Insert a limit order and attempt immediate matching. Trades are appended
+		// to `out`, which the caller owns and can reuse (clear() keeps its capacity),
+		// so once it has grown to the working size matching does no heap allocation.
+		void add_order(uint64_t id, uint64_t quantity, double price, Side side,
+					   std::vector<Trade> &out, uint64_t timestamp = 0)
 		{
 			if (quantity == 0) [[unlikely]]
 				throw std::invalid_argument("quantity must be > 0");
@@ -207,9 +207,7 @@ namespace lob
 
 			order_map_.insert(id, o);
 
-			std::vector<Trade> trades;
-			match_(trades, side);
-			return trades;
+			match_(out, side);
 		}
 
 		// O(1) cancel via the order_map lookup + intrusive list remove. If the

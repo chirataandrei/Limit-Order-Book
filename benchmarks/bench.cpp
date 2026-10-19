@@ -26,6 +26,13 @@ static constexpr uint64_t MATCH_BID_BASE= 6'000'001;  // 500k slots
 static constexpr uint64_t SWEEP_ASK_BASE= 8'000'001;  // 1k slots
 static constexpr uint64_t SWEEP_BID_BASE= 8'100'001;  // one per iteration
 
+// Setup helper: place an order that is not expected to trade.
+static void rest(OrderBook& book, uint64_t id, uint64_t qty, double px, Side side) {
+    static std::vector<Trade> sink;
+    sink.clear();
+    book.add_order(id, qty, px, side, sink);
+}
+
 // ── 1. add_order – no matching ───────────────────────────────────────────────
 // Each order goes to a unique price level (prices are id-derived), so every
 // insert opens a new level: one tick-array slot + one bitmap update.
@@ -34,15 +41,16 @@ static Stats bench_add() {
     static OrderBook book(BookConfig{ .min_price = 1'000'001.0, .tick_size = 1.0, .num_ticks = 1'000'000 });
     static constexpr uint64_t N = 1'000'000;
 
-    struct S { OrderBook* b; };
+    struct S { OrderBook* b; std::vector<Trade> trades; };
     return run_benchmark<S>(
         "add_order (1M resting, no match)", N, WARMUP, ITERS,
-        []()    -> S  { return { &book }; },
+        []()    -> S  { return { &book, {} }; },
         [](S& s)      {
             for (uint64_t i = 0; i < N; ++i) {
-                auto t = s.b->add_order(ADD_BASE + i, 100,
-                             1'000'001.0 + static_cast<double>(i), Side::Buy);
-                do_not_optimize(t.size());
+                s.trades.clear();
+                s.b->add_order(ADD_BASE + i, 100,
+                               1'000'001.0 + static_cast<double>(i), Side::Buy, s.trades);
+                do_not_optimize(s.trades.size());
             }
         },
         [](S& s) {
@@ -74,7 +82,7 @@ static Stats bench_cancel() {
         "cancel_order (500k random)", N, WARMUP, ITERS,
         []() -> S {
             for (uint64_t i = 0; i < N; ++i)
-                book.add_order(CANCEL_BASE + i, 50,
+                rest(book, CANCEL_BASE + i, 50,
                                500'000.0 + static_cast<double>(i), Side::Buy);
             return { &book, shuffled };
         },
@@ -98,18 +106,19 @@ static Stats bench_match_1for1() {
     static OrderBook book(BookConfig{ .min_price = 100.0, .tick_size = 1.0, .num_ticks = 1'000 });
     static constexpr uint64_t N = 500'000;  // each side N, peak usage N+1
 
-    struct S { OrderBook* b; };
+    struct S { OrderBook* b; std::vector<Trade> trades; };
     return run_benchmark<S>(
         "add+match (500k pairs, 1:1 fill)", N, WARMUP, ITERS,
         []() -> S {
             for (uint64_t i = 0; i < N; ++i)
-                book.add_order(MATCH_ASK_BASE + i, 1, 100.0, Side::Sell);
-            return { &book };
+                rest(book, MATCH_ASK_BASE + i, 1, 100.0, Side::Sell);
+            return { &book, {} };
         },
         [](S& s) {
             for (uint64_t i = 0; i < N; ++i) {
-                auto t = s.b->add_order(MATCH_BID_BASE + i, 1, 100.0, Side::Buy);
-                do_not_optimize(t.size());
+                s.trades.clear();
+                s.b->add_order(MATCH_BID_BASE + i, 1, 100.0, Side::Buy, s.trades);
+                do_not_optimize(s.trades.size());
             }
         },
         [](S& s) {
@@ -132,19 +141,22 @@ static Stats bench_match_sweep() {
     static constexpr uint64_t LEVELS = 1'000;
     static uint64_t sweep_bid_id = SWEEP_BID_BASE;
 
-    struct S { OrderBook* b; };
+    struct S { OrderBook* b; std::vector<Trade> trades; };
     return run_benchmark<S>(
         "sweep match (1 order clears 1k levels)", LEVELS, WARMUP, ITERS,
         []() -> S {
             for (uint64_t i = 0; i < LEVELS; ++i)
-                book.add_order(SWEEP_ASK_BASE + i, 1,
+                rest(book, SWEEP_ASK_BASE + i, 1,
                                100.0 + static_cast<double>(i), Side::Sell);
-            return { &book };
+            S s{ &book, {} };
+            s.trades.reserve(LEVELS);
+            return s;
         },
         [](S& s) {
-            auto t = s.b->add_order(sweep_bid_id++, LEVELS,
-                         100.0 + static_cast<double>(LEVELS - 1), Side::Buy);
-            do_not_optimize(t.size());
+            s.trades.clear();
+            s.b->add_order(sweep_bid_id++, LEVELS,
+                           100.0 + static_cast<double>(LEVELS - 1), Side::Buy, s.trades);
+            do_not_optimize(s.trades.size());
         },
         [](S& s) {
             for (uint64_t i = 0; i < LEVELS; ++i)

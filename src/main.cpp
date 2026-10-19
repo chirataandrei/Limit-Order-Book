@@ -174,6 +174,7 @@ namespace
 		std::map<int, uint64_t> ref_bid, ref_ask; // shadow depth: tick → resting qty
 		std::array<std::vector<uint64_t>, N_MM> quotes;
 		std::vector<uint64_t> noise_resting; // may hold stale ids (lazily cleaned)
+		std::vector<Trade> trade_buf;		 // reused by every add_order call
 		std::array<AgentStats, N_AGENTS> ag{};
 
 		// market statistics
@@ -270,7 +271,9 @@ namespace
 			const uint64_t id = next_id++;
 			live[id] = {agent, side, tick, qty};
 			++ag[agent].orders;
-			apply(book.add_order(id, qty, px_of(tick), side, now_ns()));
+			trade_buf.clear();
+			book.add_order(id, qty, px_of(tick), side, trade_buf, now_ns());
+			apply(trade_buf);
 
 			if (auto it = live.find(id); it != live.end())
 			{
