@@ -2,6 +2,7 @@
 lob
 lob_pool
 lob_tests
+lob_sim
 lob_bench
 bench
 *.o

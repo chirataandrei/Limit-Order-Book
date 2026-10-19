@@ -18,7 +18,10 @@ target_include_directories(lob INTERFACE
 )
 target_compile_options(lob INTERFACE -Wall -Wextra)
 
-add_executable(lob_tests src/main.cpp)
+add_executable(lob_sim src/main.cpp)
+target_link_libraries(lob_sim PRIVATE lob)
+
+add_executable(lob_tests tests/tests.cpp)
 target_link_libraries(lob_tests PRIVATE lob)
 
 add_executable(lob_bench benchmarks/bench.cpp)

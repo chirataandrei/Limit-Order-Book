@@ -10,6 +10,7 @@ A from-scratch central limit order book aimed at low latency. No external depend
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j
 
+./build/lob_sim     # multi-agent market simulation (also self-checking)
 ./build/lob_tests   # correctness tests
 ./build/lob_bench   # micro-benchmarks
 ```
@@ -22,21 +23,22 @@ CI (GitHub Actions) builds and runs the tests with g++ and clang++, runs them ag
 
 ```
 include/lob/
-  ObjectPool.hpp   – fixed-size pool, O(1) alloc/free, no heap after init
+  OrderPool.hpp    – fixed-size pool, O(1) alloc/free, no heap after init
   Order.hpp        – 64-byte cache-line-aligned node, intrusive list pointers + back-pointer
   PriceLevel.hpp   – intrusive doubly-linked FIFO of orders at one price
   TickBitmap.hpp   – hierarchical occupancy bitmap (O(log64 n) lowest/highest set tick)
   FlatIdMap.hpp    – open-addressing order-id -> Order* table (linear probing, backward-shift delete)
   OrderBook.hpp    – tick-indexed bid/ask level arrays, order-id lookup, add/cancel/match
   Benchmark.hpp    – minimal timing harness (setup/bench/teardown separation, warmup)
-src/main.cpp       – correctness tests
-benchmarks/bench.cpp – micro-benchmarks
-CMakeLists.txt     – builds lob_tests and lob_bench
+src/main.cpp       – event-driven market simulation (lob_sim)
+tests/tests.cpp    – correctness tests (lob_tests)
+benchmarks/bench.cpp – micro-benchmarks (lob_bench)
+CMakeLists.txt     – builds lob_sim, lob_tests and lob_bench
 ```
 
 ## How it works
 
-**Memory** — `ObjectPool<Order, 1'000'000>` grabs 64 MB once at startup. Every `add_order` pops from a free list; every `cancel_order` or fill pushes back. No heap traffic on the hot path.
+**Memory** — `OrderPool(1'000'000)` grabs 64 MB once at startup. Every `add_order` pops from a free list; every `cancel_order` or fill pushes back. No heap traffic on the hot path.
 
 **Price levels** — each side is a dense `PriceLevel[]` indexed by tick: level `i` sits at `min_price + i * tick_size`, set through `BookConfig{min_price, tick_size, num_ticks}` (default grid is 0.00–999.99 in 0.01 steps). `add_order` converts the price to a tick once and then indexes straight into the array — O(1), no tree walk, no node allocation. Prices off the grid or outside it throw `std::invalid_argument`.
 
@@ -47,6 +49,17 @@ CMakeLists.txt     – builds lob_tests and lob_bench
 **Intrusive list** — `Order` carries its own `prev`/`next` pointers, so `PriceLevel::remove()` is O(1) with no search. The `level` back-pointer lets `cancel_order()` go straight from order ID → `Order*` → `PriceLevel*` → intrusive remove, with no price lookup at all.
 
 **Matching** — `match_()` is called inside `add_order()`. It loops while `best_bid >= best_ask`, pops the front of each queue (FIFO priority), fills them, and cleans up any exhausted levels. Execution price is the resting (maker) order's price: `add_order()` matches after every insert, so the book is never crossed on entry and the aggressor is always the order just added. Each `Trade` records its `aggressor` side; a buy that lifts an ask trades at the ask, a sell that hits a bid trades at the bid.
+
+## Market simulation
+
+`src/main.cpp` runs 30 simulated minutes of trading through the real `OrderBook` (about 0.15 s of wall time). A hidden fundamental value follows a diffusion with occasional news jumps, and six agents trade against each other:
+
+- **3 market makers** (fast / mid / slow) quote a 3-level ladder around a lagged estimate of the fundamental, skewed by inventory.
+- **Noise trader** — passive limits near the mid, random marketable (IOC) orders and random cancels.
+- **Informed trader** — sees the true fundamental and sweeps anything priced away from it.
+- **Momentum trader** — chases the mid-price move of the last 5 seconds.
+
+Time is simulated and passed to `add_order` as nanosecond timestamps. The run prints a progress table, the final book, a fundamental-vs-mid price path, market statistics (spread, depth, volatility, VWAP, order-to-trade ratio) and per-agent inventory and PnL. It also checks itself: a shadow model rebuilt from the trade stream is compared with the book throughout, the book must never be crossed, draining it must leave it empty, and inventory and cash must net to zero across agents. Like the tests, it relies on `assert`.
 
 ## Benchmark results
 
