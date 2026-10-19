@@ -95,7 +95,18 @@ Measured by the manual `Benchmark (Linux x86)` workflow (`.github/workflows/benc
 | `add+match` — 1:1 fill | 111–116 ns | 150–191 ns | 208–228 ns | 214–228 ns |
 | sweep (per level) | 17–19 ns | 29–49 ns | 28–30 ns | 43–45 ns |
 
-The last column is a fresh run of the workflow on the current tree (three runs, `taskset -c 1`). **It is not comparable with the column before it:** GitHub handed out a different CPU (EPYC 9V74 instead of 9V45), and even `cancel_order`, which the trade-buffer change does not touch, is ~1.8× slower, so most of the gap is the runner, not the code. The one-column-at-a-time comparison the M4 table makes is not possible on shared runners; the buffer's effect (~25 ns on `add+match`) is only established on the M4. The M4 and ARM64 VM columns have not been re-run since the buffer change.
+The last column is a fresh run of the workflow on the current tree (three runs, `taskset -c 1`). **It is not comparable with the column before it:** GitHub handed out a different CPU (EPYC 9V74 instead of 9V45), and even `cancel_order`, which the trade-buffer change does not touch, is ~1.8× slower, so most of the gap is the runner, not the code. The one-column-at-a-time comparison the M4 table makes is not possible on shared runners; the buffer's effect (~25 ns on `add+match`) is only established on the M4. The M4 and UTM ARM64 VM columns have not been re-run since the buffer change; the A/B run below covers Linux ARM64 instead.
+
+**Same-environment A/B on Linux ARM64.** Because the runner comparison above is unusable, the effect of the trade buffer was measured back to back in one container: Docker Desktop's Linux aarch64 VM on the same M4 Mac (10 vCPUs), `gcc:13` (g++ 13.5), `-O2`, pinned with `taskset -c 2`, commit before the change (vector returned) vs. after (caller-owned buffer), three alternating runs each. `-march=native` is left out here because this container's assembler rejects it for the M4 (`eor3`), so absolute numbers are not comparable with the other tables.
+
+| Scenario | vector returned | caller-owned buffer |
+|---|---|---|
+| `add_order` — 1M resting | 78–83 ns | 80–81 ns |
+| `cancel_order` — 500k random | 53–55 ns | 54–55 ns |
+| `add+match` — 1:1 fill | 123–128 ns | 116–118 ns |
+| sweep (per level) | 23–23.5 ns (one 56 ns outlier run) | 21.7–22.6 ns |
+
+The gain is real but much smaller than on macOS (~6% on `add+match` against ~25%): glibc's `malloc` for a one-element vector is cheap next to macOS's allocator. Cases without trades are unchanged, as expected.
 
 The middle column is a Linux (aarch64) guest under Apple Virtualization on the same M4 Mac, three runs, pinned with `taskset -c 2`. It is **not x86**: it isolates the cost of "Linux in a VM" from the cost of the CPU architecture. The two EPYC columns are GitHub runners only.
 
